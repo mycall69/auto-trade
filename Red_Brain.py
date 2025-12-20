@@ -7,6 +7,10 @@ from PyQt5.QtCore import *        # QEventLoop를 사용하기 위해 불러오�
 
 from kiwoom import Kiwoom          # 키움증권 함수/공용 방 (싱글턴)
 from Rthread_1 import Thread1      # 계좌평가잔고내역 가져오기
+from Rthread_2 import Thread2      # github에서 오늘의 종목을 불러오는 Thread
+from Rthread_3 import Thread3      # 내 계좌의 상태를 판단하자
+from Rthread_4 import Thread4      # 자동매매 Thread
+
 
 #=================== 프로그램 실행 하는 부분 =========================#
 
@@ -28,17 +32,54 @@ class Red_Brain(QMainWindow, QWidget, form_class):       # QMainWindow, PyQt5에
         self.label_6.setText(str("총평가손익금액"))
         self.label_7.setText(str("총수익률(%)"))
 
-
         #### 기타 함수
         self.login_event_loop = QEventLoop()  #  QEventLoop()는 block 기능을 가지고 있음...!!
+
+        # github에서 txt 가지고 오기
+        self.selected_url = "https://raw.githubusercontent.com/mycall69/auto-trade/refs/heads/master/selected.txt"
 
         ####키움증권 로그인 하기
         self.k = Kiwoom()
         self.set_signal_slot()
         self.signal_login_commConnect()
 
-        #####이벤트 생성 및 진행
+        ##Buylists 테이블 초기화
+        self.buylists.setColumnCount(3)
+        self.buylists.setHorizontalHeaderLabels(["종목코드", "종목명", "종가"])
+
+        ######## searchItemTextEdit2를 QLineEdit으로 변경 ########
+        # UI의 QTableWidget를 QLineEdit으로 교체
+        try:
+            self.searchItemTextEdit2.deleteLater()  # 기존 위젯 제거
+            self.searchItemTextEdit2 = QLineEdit(self.centralwidget)  # QLineEdit으로 생성
+            self.searchItemTextEdit2.setGeometry(640, 690, 131, 41)  # 위치와 크기 설정
+            self.searchItemTextEdit2.setPlaceholderText("종목명 입력")  # 플레이스홀더 추가
+            print("searchItemTextEdit2를 QLineEdit으로 변경 완료")
+        except Exception as e:
+            print(f"searchItemTextEdit2 변경 오류: {e}")
+
+        ######## 자동매매 관련 변수 초기화 ########
+        self.is_auto_trading = False
+        self.auto_trade_thread = None
+        self.realtime_update_thread = None
+
+        ##### 이벤트 생성 및 진행
         self.call_account.clicked.connect(self.r_acc)         # 계좌정보가져오기
+
+        ##이벤트 2. github에서 오늘의 종목 가지고 오기
+        self.call_selectedlist.clicked.connect(self.load_selected_list)
+
+        ##이벤트 3. 계좌 위험도 분석 이벤트
+        self.redacc_manager.clicked.connect(self.a_manage)
+
+        ## 이벤트 4. 종목 추가
+        self.additmelist.clicked.connect(self.add_stock_to_buylist)
+
+        ## 이벤트 5. 종목 삭제
+        self.Deletcode.clicked.connect(self.delete_stock_from_buylist)
+
+        ## 이벤트 6. 종목 불러오기
+        self.Load_Stock.clicked.connect(self.load_stocks_to_buylist)
 
     def setUI(self):
         self.setupUi(self)                # UI 초기값 셋업
@@ -75,6 +116,278 @@ class Red_Brain(QMainWindow, QWidget, form_class):       # QMainWindow, PyQt5에
         ##### 1번 일꾼 실행
         h1 = Thread1(self)
         h1.start()
+
+    def load_selected_list(self):
+        print("오늘의 종목 불러오기")
+        ##Rthread_2 실행
+        self.thread2 = Thread2(self.selected_url)
+        self.thread2.data_ready.connect(self.update_selected_table)
+        self.thread2.start()
+
+    def update_selected_table(self, data):
+        table = self.selectedstockTableWidget_2
+        table.clearContents()
+        table.setRowCount(len(data))
+        table.setColumnCount(3)
+        table.setHorizontalHeaderLabels(["종목코드", "종목명", "종가"])
+
+        for row, (code, name, last_close) in enumerate(data):
+            table.setItem(row, 0, QTableWidgetItem(code))
+            table.setItem(row, 1, QTableWidgetItem(name))
+            table.setItem(row, 2, QTableWidgetItem(str(last_close)))
+
+    def a_manage(self):
+        print("계좌 위험도 분석")
+        h2 = Thread3(self)
+        h2.start()
+
+    def add_stock_to_buylist(self):
+        """종목명을 입력받아 buylists에 추가"""
+        try:
+            stock_name = self.searchItemTextEdit2.text().strip()
+
+            if not stock_name:
+                QMessageBox.warning(self, "경고", "종목명을 입력해주세요.")
+                return
+
+            # 종목코드 찾기 (k.All_Stock_Code에서 종목명으로 검색)
+            code_found = None
+            for code, info in self.k.All_Stock_Code.items():
+                if info.get("종목명") == stock_name:
+                    code_found = code
+                    break
+
+            if not code_found:
+                # All_Stock_Code가 비어있을 경우 키움API에서 직접 검색
+                # 모든 종목 코드 가져오기
+                kospi = self.k.kiwoom.dynamicCall("GetCodeListByMarket(QString)", ["0"]).split(';')[:-1]
+                kosdaq = self.k.kiwoom.dynamicCall("GetCodeListByMarket(QString)", ["10"]).split(';')[:-1]
+                all_codes = kospi + kosdaq
+
+                for code in all_codes:
+                    name = self.k.kiwoom.dynamicCall("GetMasterCodeName(QString)", code)
+                    if name.strip() == stock_name:
+                        code_found = code
+                        break
+            if not code_found:
+                QMessageBox.warning(self, "경고", f"'{stock_name}' 종목을 찾을 수 없습니다.")
+                return
+
+            # 현재가 가져오기 (임시로 0으로 설정)
+            #self.k.kiwoom.dynamicCall("SetInputValue(QString, QString)", "종목코드", code_found)
+            #self.k.kiwoom.dynamicCall("CommRqData(QString, QString, int, QString)",
+            #                          "주식기본정보요청", "opt10001", 0, "0101")
+
+            # 간단하게 처리하기 위해 임시로 0으로 설정 (실제로는 현재가를 받아와야 함)
+            current_price = "0"
+
+            # 중복 체크
+            for i in range(self.buylists.rowCount()):
+                if self.buylists.item(i, 0) and self.buylists.item(i, 0).text() == code_found:
+                    QMessageBox.information(self, "알림", "이미 추가된 종목입니다.")
+                    return
+
+            # buylists에 추가
+            row_count = self.buylists.rowCount()
+            self.buylists.insertRow(row_count)
+            self.buylists.setItem(row_count, 0, QTableWidgetItem(code_found))
+            self.buylists.setItem(row_count, 1, QTableWidgetItem(stock_name))
+            self.buylists.setItem(row_count, 2, QTableWidgetItem(current_price))
+
+            print(f"종목 추가: {code_found} {stock_name}")
+            self.searchItemTextEdit2.clear()  # 입력창 초기화
+
+        except Exception as e:
+            print(f"종목 추가 오류: {e}")
+            QMessageBox.critical(self, "오류", f"종목 추가 중 오류 발생:\n{str(e)}")
+
+    def delete_stock_from_buylist(self):
+        """buylists에서 선택된 종목 삭제"""
+        try:
+            current_row = self.buylists.currentRow()
+
+            if current_row < 0:
+                QMessageBox.warning(self, "경고", "삭제할 종목을 선택해주세요.")
+                return
+
+            # 삭제 확인
+            code = self.buylists.item(current_row, 0).text() if self.buylists.item(current_row, 0) else ""
+            name = self.buylists.item(current_row, 1).text() if self.buylists.item(current_row, 1) else ""
+
+            reply = QMessageBox.question(self, '확인',
+                                        f'{code} {name} 종목을 삭제하시겠습니까?',
+                                        QMessageBox.Yes | QMessageBox.No,
+                                        QMessageBox.No)
+
+            if reply == QMessageBox.Yes:
+                self.buylists.removeRow(current_row)
+                print(f"종목 삭제: {code} {name}")
+
+        except Exception as e:
+            print(f"종목 삭제 오류: {e}")
+            QMessageBox.critical(self, "오류", f"종목 삭제 중 오류 발생:\n{str(e)}")
+
+
+    def load_stocks_to_buylist(self):
+        """selectedstockTableWidget_2에서 buylists로 모든 종목 불러오기"""
+        try:
+            selected_table = self.selectedstockTableWidget_2
+
+            if selected_table.rowCount() == 0:
+                QMessageBox.warning(self, "경고", "불러올 종목이 없습니다.")
+                return
+
+            if self.buylists.rowCount() > 0:
+                reply = QMessageBox.question(self, '확인',
+                                             '기존 목록을 초기화하고 불러오시겠습니까?',
+                                             QMessageBox.Yes | QMessageBox.No,
+                                             QMessageBox.Yes)
+                if reply == QMessageBox.Yes:
+                    self.buylists.setRowCount(0)
+
+            added_count = 0
+            for row in range(selected_table.rowCount()):
+                code_item = selected_table.item(row, 0)
+                name_item = selected_table.item(row, 1)
+                price_item = selected_table.item(row, 2)
+
+                if code_item and name_item and price_item:
+                    code = code_item.text()
+                    name = name_item.text()
+                    price = price_item.text()
+
+                    # 중복 체크
+                    duplicate = False
+                    for i in range(self.buylists.rowCount()):
+                        if self.buylists.item(i, 0) and self.buylists.item(i, 0).text() == code:
+                            duplicate = True
+                            break
+
+                    if not duplicate:
+                        row_count = self.buylists.rowCount()
+                        self.buylists.insertRow(row_count)
+                        self.buylists.setItem(row_count, 0, QTableWidgetItem(code))
+                        self.buylists.setItem(row_count, 1, QTableWidgetItem(name))
+                        self.buylists.setItem(row_count, 2, QTableWidgetItem(price))
+                        added_count += 1
+
+            QMessageBox.information(self, "완료", f"{added_count}개 종목을 불러왔습니다.")
+            print(f"종목 불러오기 완료: {added_count}개")
+
+        except Exception as e:
+            print(f"종목 불러오기 오류: {e}")
+            QMessageBox.critical(self, "오류", f"종목 불러오기 중 오류 발생:\n{str(e)}")
+
+    def auto_trade_start_stop(self):
+        """자동매매 시작/중지"""
+        try:
+            print("자동매매 버튼 클릭")
+
+            if not self.is_auto_trading:
+                # 자동매매 시작
+                print("자동매매 시작 준비")
+
+                if self.buylists.rowCount() == 0:
+                    QMessageBox.warning(self, "경고", "매수할 종목이 없습니다.")
+                    return
+
+                if self.buy_price.value() == 0:
+                    QMessageBox.warning(self, "경고", "매수 금액을 입력해주세요.")
+                    return
+
+                if self.profit_percent.value() == 0:
+                    QMessageBox.warning(self, "경고", "익절 수익률을 입력해주세요.")
+                    return
+
+                reply = QMessageBox.question(self, '확인',
+                                             '자동매매를 시작하시겠습니까?',
+                                             QMessageBox.Yes | QMessageBox.No,
+                                             QMessageBox.No)
+
+                if reply == QMessageBox.Yes:
+                    print("자동매매 시작 확인")
+                    self.is_auto_trading = True
+                    self.Red_Auto_start.setText("자동매매 중지")
+                    self.Red_Auto_start.setStyleSheet("background-color: red; color: white;")
+
+                    try:
+                        # 자동매매 Thread 시작
+                        print("Thread4 생성 시작")
+                        self.auto_trade_thread = Thread4(self)
+                        self.auto_trade_thread.update_status.connect(self.update_status_message)
+                        self.auto_trade_thread.trade_done.connect(self.handle_trade_done)
+                        self.auto_trade_thread.start()
+                        print("Thread4 시작 완료")
+
+                        # 실시간 업데이트 Thread 시작
+                        print("실시간 계좌 업데이트는 비활성화됨")
+
+                        self.statusbar.showMessage("자동매매가 시작되었습니다.")
+
+                    except Exception as thread_error:
+                        print(f"Thread 시작 오류: {thread_error}")
+                        self.is_auto_trading = False
+                        self.Red_Auto_start.setText("자동매매")
+                        self.Red_Auto_start.setStyleSheet("")
+                        QMessageBox.critical(self, "오류", f"자동매매 Thread 시작 실패:\n{str(thread_error)}")
+
+            else:
+                # 자동매매 중지
+                print("자동매매 중지 준비")
+                reply = QMessageBox.question(self, '확인',
+                                             '자동매매를 중지하시겠습니까?',
+                                             QMessageBox.Yes | QMessageBox.No,
+                                             QMessageBox.No)
+
+                if reply == QMessageBox.Yes:
+                    print("자동매매 중지 확인")
+                    self.is_auto_trading = False
+                    self.Red_Auto_start.setText("자동매매")
+                    self.Red_Auto_start.setStyleSheet("")
+
+                    # Thread 중지
+                    if hasattr(self, 'auto_trade_thread') and self.auto_trade_thread:
+                        self.auto_trade_thread.stop()
+                        print("Thread4 중지")
+                    if hasattr(self, 'realtime_update_thread') and self.realtime_update_thread:
+                        self.realtime_update_thread.stop()
+                        print("Thread5 중지")
+
+                    self.statusbar.showMessage("자동매매가 중지되었습니다.")
+
+        except Exception as e:
+            print(f"자동매매 버튼 오류: {e}")
+            import traceback
+            traceback.print_exc()
+            QMessageBox.critical(self, "오류", f"자동매매 처리 중 오류 발생:\n{str(e)}")
+
+    def update_status_message(self, message):
+        """상태바 메시지 업데이트"""
+        try:
+            self.statusbar.showMessage(message)
+            print(f"상태 메시지: {message}")
+        except Exception as e:
+            print(f"상태 메시지 업데이트 오류: {e}")
+
+    def handle_trade_done(self, trade_info):
+        """매매 완료 처리"""
+        try:
+            code = trade_info.get("종목코드")
+            name = trade_info.get("종목명")
+            rate = trade_info.get("수익률")
+            trade_type = trade_info.get("매매구분")
+
+            QMessageBox.information(self, "매매 체결",
+                                    f"{trade_type} 완료\n"
+                                    f"종목: {code} {name}\n"
+                                    f"수익률: {rate}%")
+            print(f"매매 체결: {trade_type} {code} {name} {rate}%")
+        except Exception as e:
+            print(f"매매 완료 처리 오류: {e}")
+
+    def update_account_info(self, account_info):
+        """계좌 정보 업데이트 (Thread5 없이는 사용 안함)"""
+        pass
 
 if __name__=='__main__':             # import된 것들을 실행시키지 않고 __main__에서 실행하는 것만 실행 시킨다.
                                      # 즉 import된 다른 함수의 코드를 이 화면에서 실행시키지 않겠다는 의미이다.
